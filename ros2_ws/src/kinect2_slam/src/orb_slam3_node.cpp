@@ -1,0 +1,171 @@
+// ORB-SLAM3 ROS2 Node for Kinect v2 RGB-D
+// RGB-D only mode (no IMU) for stable tracking without calibration
+
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <cv_bridge/cv_bridge.hpp>
+#include <message_filters/subscriber.h>
+#include <message_filters/time_synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
+#include <tf2_ros/tf2_ros/transform_broadcaster.hpp>
+#include <opencv2/opencv.hpp>
+
+#include "System.h"
+
+class OrbSlam3Node : public rclcpp::Node
+{
+public:
+    OrbSlam3Node() : Node("orb_slam3_node")
+    {
+        // Declare parameters
+        this->declare_parameter("voc_file", "");
+        this->declare_parameter("settings_file", "");
+        
+        std::string voc_file = this->get_parameter("voc_file").as_string();
+        std::string settings_file = this->get_parameter("settings_file").as_string();
+        
+        RCLCPP_INFO(this->get_logger(), "Vocabulary file: %s", voc_file.c_str());
+        RCLCPP_INFO(this->get_logger(), "Settings file: %s", settings_file.c_str());
+        
+        // Initialize ORB-SLAM3 system in RGB-D mode (no IMU)
+        slam_system_ = std::make_shared<ORB_SLAM3::System>(
+            voc_file, settings_file, ORB_SLAM3::System::RGBD, true);
+        
+        // Subscribers for RGB-D
+        rgb_sub_.subscribe(this, "/kinect2/hd/image_color");
+        depth_sub_.subscribe(this, "/kinect2/hd/image_depth_rect");
+        auto imu_qos = rclcpp::QoS(rclcpp::KeepLast(1000))
+            .reliability(RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT)
+            .durability(RMW_QOS_POLICY_DURABILITY_VOLATILE);
+        
+        // Synchronizer for RGB-D
+        typedef message_filters::sync_policies::ApproximateTime<
+            sensor_msgs::msg::Image, sensor_msgs::msg::Image> SyncPolicy;
+        sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
+            SyncPolicy(10), rgb_sub_, depth_sub_);
+        sync_->registerCallback(
+            std::bind(&OrbSlam3Node::rgbdCallback, this, 
+                     std::placeholders::_1, std::placeholders::_2));
+        
+        // Publisher
+        pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+            "/orb_slam3/pose", 10);
+        
+        // TF2 broadcaster for camera pose
+        tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
+        
+        RCLCPP_INFO(this->get_logger(), "ORB-SLAM3 RGB-D node initialized (no IMU)");
+    }
+    
+    ~OrbSlam3Node()
+    {
+        if (slam_system_) {
+            slam_system_->Shutdown();
+        }
+    }
+
+private:
+    void rgbdCallback(const sensor_msgs::msg::Image::ConstSharedPtr& rgb_msg,
+                     const sensor_msgs::msg::Image::ConstSharedPtr& depth_msg)
+    {
+        // Convert ROS images to OpenCV
+        cv_bridge::CvImageConstPtr cv_rgb, cv_depth;
+        try {
+            cv_rgb = cv_bridge::toCvShare(rgb_msg, "bgr8");
+            cv_depth = cv_bridge::toCvShare(depth_msg, sensor_msgs::image_encodings::TYPE_16UC1);
+        } catch (cv_bridge::Exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
+            return;
+        }
+        
+        double timestamp = rgb_msg->header.stamp.sec + rgb_msg->header.stamp.nanosec * 1e-9;
+        
+        
+        // Track frame (RGB-D only, no IMU)
+        Sophus::SE3f Tcw = slam_system_->TrackRGBD(
+            cv_rgb->image, cv_depth->image, timestamp);
+        
+        // Publish pose
+        Eigen::Vector3f t = Tcw.translation();
+        if (t.norm() > 0.001) {  // Check if pose is valid
+            geometry_msgs::msg::PoseStamped pose_msg;
+            pose_msg.header.stamp = rgb_msg->header.stamp;
+            pose_msg.header.frame_id = "map";
+            
+            // Convert SE3 to ROS Pose (invert to get camera pose in world frame)
+            Sophus::SE3f Twc = Tcw.inverse();
+            Eigen::Matrix3f R_orb = Twc.rotationMatrix();
+            Eigen::Vector3f t_orb = Twc.translation();
+            
+            // Transform from ORB-SLAM3 frame to ROS optical frame
+            // ORB-SLAM3: X-right, Y-down, Z-forward (OpenCV convention)
+            // ROS optical: X-right, Y-down, Z-forward (same!)
+            // But we need to publish in camera_link frame for RViz
+            // ROS camera_link: X-forward, Y-left, Z-up
+            // Transformation: [X_ros, Y_ros, Z_ros] = [Z_orb, -X_orb, -Y_orb]
+            
+            Eigen::Matrix3f R_transform;
+            R_transform << 0, 0, 1,
+                          -1, 0, 0,
+                           0, -1, 0;
+            
+            Eigen::Matrix3f R_ros = R_transform * R_orb;
+            Eigen::Vector3f t_ros;
+            t_ros(0) = t_orb(2);   // X_ros = Z_orb (forward)
+            t_ros(1) = -t_orb(0);  // Y_ros = -X_orb (left)
+            t_ros(2) = -t_orb(1);  // Z_ros = -Y_orb (up)
+            
+            pose_msg.pose.position.x = t_ros(0);
+            pose_msg.pose.position.y = t_ros(1);
+            pose_msg.pose.position.z = t_ros(2);
+            
+            Eigen::Quaternionf q(R_ros);
+            pose_msg.pose.orientation.x = q.x();
+            pose_msg.pose.orientation.y = q.y();
+            pose_msg.pose.orientation.z = q.z();
+            pose_msg.pose.orientation.w = q.w();
+            
+            pose_pub_->publish(pose_msg);
+            
+            // Broadcast TF2 transform: map -> camera
+            geometry_msgs::msg::TransformStamped transform;
+            transform.header.stamp = rgb_msg->header.stamp;
+            transform.header.frame_id = "map";
+            transform.child_frame_id = "camera_pose";
+            
+            transform.transform.translation.x = t_ros(0);
+            transform.transform.translation.y = t_ros(1);
+            transform.transform.translation.z = t_ros(2);
+            
+            transform.transform.rotation.x = q.x();
+            transform.transform.rotation.y = q.y();
+            transform.transform.rotation.z = q.z();
+            transform.transform.rotation.w = q.w();
+            
+            tf_broadcaster_->sendTransform(transform);
+        }
+    }
+    
+    std::shared_ptr<ORB_SLAM3::System> slam_system_;
+    
+    message_filters::Subscriber<sensor_msgs::msg::Image> rgb_sub_;
+    message_filters::Subscriber<sensor_msgs::msg::Image> depth_sub_;
+    
+    typedef message_filters::sync_policies::ApproximateTime<
+        sensor_msgs::msg::Image, sensor_msgs::msg::Image> SyncPolicy;
+    std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
+    
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
+    std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+};
+
+int main(int argc, char** argv)
+{
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<OrbSlam3Node>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}

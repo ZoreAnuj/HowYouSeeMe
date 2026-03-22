@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""
+InsightFace Worker - Face Detection, Recognition, and Liveness Detection
+Supports modular modes for pipeline composition
+"""
+
+import numpy as np
+import cv2
+import time
+import os
+import pickle
+import json
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+try:
+    import insightface
+    from insightface.app import FaceAnalysis
+    INSIGHTFACE_AVAILABLE = True
+except ImportError:
+    INSIGHTFACE_AVAILABLE = False
+    print("Warning: InsightFace not installed. Install with: pip install insightface onnxruntime-gpu")
+
+try:
+    from hsemotion.facial_emotions import HSEmotionRecognizer
+    import torch
+    HSEMOTION_AVAILABLE = True
+except ImportError:
+    HSEMOTION_AVAILABLE = False
+    print("Info: HSEmotion not installed. For emotion detection, install with: pip install hsemotion")
+    print("Note: HSEmotion is a high-speed emotion detector with better accuracy than FER")
+
+
+class InsightFaceWorker:
+    """
+    InsightFace worker for face detection, recognition, liveness detection, and emotion recognition
+    
+    Modes:
+    - detect: Face detection only (returns bboxes and landmarks)
+    - recognize: Face recognition only (assumes cropped face input)
+    - detect_recognize: Full pipeline (detect + recognize)
+    - register: Register new face to database
+    - liveness: Liveness detection using depth
+    - emotion: Emotion recognition (7 emotions)
+    - analyze: Full analysis (detect + recognize + liveness + attributes + emotion)
+    """
+    
+    def __init__(self, device="cuda"):
+        if not INSIGHTFACE_AVAILABLE:
+            raise ImportError("InsightFace not installed")
+        
+        self.device = device
+        self.app = None
+        self.detector = None
+        self.recognizer = None
+        self.emotion_detector = None
+        
+        # Face database — resolve absolute path from workspace root
+        # This file lives at ros2_ws/src/cv_pipeline/python/insightface_worker.py
+        # Workspace root is 4 levels up
+        _this_file = Path(__file__).resolve()
+        _ws_root = _this_file.parents[4]  # HowYouSeeMe/
+        self.database_path = _ws_root / "data" / "faces"
+        self.database_path.mkdir(parents=True, exist_ok=True)
+        self.db_file = self.database_path / "face_database.pkl"
+        self.metadata_file = self.database_path / "metadata.json"
+        
+        self.face_database = self.load_database()
+        self.metadata = self.load_metadata()
+        
+        # Recognition parameters — buffalo_l cosine sim: ~0.3-0.5 for same person
+        self.similarity_threshold = 0.45
+        self.min_face_size = 20
+        
+        print("InsightFace Worker initialized")
+    
+    def load_models(self, model_pack="buffalo_l"):
+        """Load InsightFace models"""
+        print(f"Loading InsightFace models: {model_pack}")
+        
+        # Full analysis app (includes detection, recognition, age/gender)
+        self.app = FaceAnalysis(name=model_pack, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        
+        # Detection only app
+        self.detector = FaceAnalysis(
+            name=model_pack,
+            allowed_modules=['detection'],
+            providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+        )
+        
+        # Note: We use self.app for recognition since InsightFace requires detection module
+        # The recognizer needs detection to work properly
+        self.recognizer = self.app  # Use full app for recognition
+        
+        # Load emotion detector if available
+        if HSEMOTION_AVAILABLE:
+            try:
+                # HSEmotion supports multiple models: enet_b0_8_best_afew, enet_b0_8_best_vgaf, enet_b2_8
+                model_name = 'enet_b0_8_best_afew'  # Best for general use
+                device = 'cuda' if self.device == 'cuda' and torch.cuda.is_available() else 'cpu'
+                self.emotion_detector = HSEmotionRecognizer(model_name=model_name, device=device)
+                print(f"HSEmotion detector loaded successfully on {device}")
+            except Exception as e:
+                print(f"Failed to load HSEmotion detector: {e}")
+                self.emotion_detector = None
+        
+        print("InsightFace models loaded successfully")
+    
+    def prepare(self, det_size=(640, 640), det_thresh=0.5):
+        """Prepare models for inference"""
+        ctx_id = 0 if self.device == "cuda" else -1
+        
+        if self.app:
+            self.app.prepare(ctx_id=ctx_id, det_size=det_size, det_thresh=det_thresh)
+        if self.detector:
+            self.detector.prepare(ctx_id=ctx_id, det_size=det_size, det_thresh=det_thresh)
+        if self.recognizer:
+            self.recognizer.prepare(ctx_id=ctx_id)
+        
+        print(f"Models prepared: det_size={det_size}, det_thresh={det_thresh}")
+    
+    def load_database(self) -> Dict:
+        """Load face database from disk"""
+        if self.db_file.exists():
+            with open(self.db_file, 'rb') as f:
+                db = pickle.load(f)
+            print(f"[InsightFace] Loaded DB from {self.db_file} — {len(db)} people")
+            return db
+        print(f"[InsightFace] No DB found at {self.db_file} — starting empty")
+        return {}
+    
+    def save_database(self):
+        """Save face database to disk"""
+        with open(self.db_file, 'wb') as f:
+            pickle.dump(self.face_database, f)
+    
+    def load_metadata(self) -> Dict:
+        """Load metadata from disk"""
+        if self.metadata_file.exists():
+            with open(self.metadata_file, 'r') as f:
+                return json.load(f)
+        return {}
+    
+    def save_metadata(self):
+        """Save metadata to disk"""
+        with open(self.metadata_file, 'w') as f:
+            json.dump(self.metadata, f, indent=2)
+    
+    def detect_faces(self, image: np.ndarray, params: Dict) -> Dict:
+        """
+        Mode: detect
+        Detect faces only, return bounding boxes and landmarks
+        """
+        start_time = time.time()
+        
+        det_size = int(params.get('det_size', 640))
+        max_num = int(params.get('max_num', 0))  # 0 = no limit
+        
+        # Detect faces
+        faces = self.detector.get(image, max_num=max_num)
+        
+        # Extract results
+        results = []
+        for face in faces:
+            results.append({
+                'bbox': face.bbox.tolist(),
+                'det_score': float(face.det_score),
+                'landmarks': face.kps.tolist() if face.kps is not None else None
+            })
+        
+        processing_time = time.time() - start_time
+        
+        return {
+            'mode': 'detect',
+            'num_faces': len(results),
+            'faces': results,
+            'processing_time': processing_time
+        }
+    
+    def recognize_face(self, face_image: np.ndarray, params: Dict) -> Dict:
+        """
+        Mode: recognize
+        Recognize a single face (assumes already cropped/aligned)
+        """
+        start_time = time.time()
+        
+        threshold = float(params.get('threshold', self.similarity_threshold))
+        
+        # Get embedding
+        faces = self.app.get(face_image)
+        
+        if len(faces) == 0:
+            return {
+                'mode': 'recognize',
+                'recognized': False,
+                'reason': 'no_face_detected',
+                'processing_time': time.time() - start_time
+            }
+        
+        face = faces[0]
+        embedding = face.normed_embedding
+        
+        # Match against database
+        best_match = self.match_face(embedding, threshold)
+        
+        processing_time = time.time() - start_time
+        
+        if best_match:
+            return {
+                'mode': 'recognize',
+                'recognized': True,
+                'person_id': best_match['person_id'],
+                'name': best_match['name'],
+                'similarity': best_match['similarity'],
+                'confidence': best_match['similarity'],
+                'processing_time': processing_time
+            }
+        else:
+            return {
+                'mode': 'recognize',
+                'recognized': False,
+                'reason': 'no_match_found',
+                'processing_time': processing_time
+            }
+    
+    def detect_and_recognize(self, image: np.ndarray, params: Dict) -> Dict:
+        """
+        Mode: detect_recognize
+        Full pipeline: detect faces then recognize each one
+        """
+        start_time = time.time()
+        
+        threshold = float(params.get('threshold', self.similarity_threshold))
+        max_num = int(params.get('max_num', 0))
+        
+        # Detect and analyze faces
+        faces = self.app.get(image, max_num=max_num)
+        
+        results = []
+        for face in faces:
+            embedding = face.normed_embedding
+            best_match = self.match_face(embedding, threshold)
+            
+            face_result = {
+                'bbox': face.bbox.tolist(),
+                'det_score': float(face.det_score),
+                'landmarks': face.kps.tolist() if face.kps is not None else None,
+            }
+            
+            if best_match:
+                face_result.update({
+                    'recognized': True,
+                    'person_id': best_match['person_id'],
+                    'name': best_match['name'],
+                    'similarity': best_match['similarity']
+                })
+            else:
+                face_result.update({
+                    'recognized': False,
+                    'person_id': 'unknown'
+                })
+            
+            # Add attributes if available
+            if hasattr(face, 'age') and face.age is not None:
+                face_result['age'] = int(face.age)
+            if hasattr(face, 'gender') and face.gender is not None:
+                face_result['gender'] = 'M' if face.gender == 1 else 'F'
+            
+            results.append(face_result)
+        
+        processing_time = time.time() - start_time
+        
+        return {
+            'mode': 'detect_recognize',
+            'num_faces': len(results),
+            'faces': results,
+            'processing_time': processing_time
+        }
+    
+    def register_face(self, image: np.ndarray, params: Dict) -> Dict:
+        """
+        Mode: register
+        Register a new face to the database
+        """
+        start_time = time.time()
+        
+        name = params.get('name', 'unknown')
+        person_id = params.get('person_id', f"person_{len(self.face_database):03d}")
+        
+        # Detect face
+        faces = self.app.get(image)
+        
+        if len(faces) == 0:
+            return {
+                'mode': 'register',
+                'success': False,
+                'reason': 'no_face_detected',
+                'processing_time': time.time() - start_time
+            }
+        
+        if len(faces) > 1:
+            return {
+                'mode': 'register',
+                'success': False,
+                'reason': 'multiple_faces_detected',
+                'num_faces': len(faces),
+                'processing_time': time.time() - start_time
+            }
+        
+        face = faces[0]
+        embedding = face.normed_embedding
+        
+        # Add to database
+        if person_id not in self.face_database:
+            self.face_database[person_id] = {
+                'embeddings': [],
+                'name': name
+            }
+            self.metadata[person_id] = {
+                'name': name,
+                'first_seen': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'encounter_count': 0,
+                'samples': 0
+            }
+        
+        self.face_database[person_id]['embeddings'].append(embedding)
+        self.metadata[person_id]['samples'] = len(self.face_database[person_id]['embeddings'])
+        self.metadata[person_id]['last_updated'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Save to disk
+        self.save_database()
+        self.save_metadata()
+        
+        processing_time = time.time() - start_time
+        
+        return {
+            'mode': 'register',
+            'success': True,
+            'person_id': person_id,
+            'name': name,
+            'num_samples': len(self.face_database[person_id]['embeddings']),
+            'processing_time': processing_time
+        }
+    
+    def detect_emotion(self, image: np.ndarray, params: Dict) -> Dict:
+        """
+        Mode: emotion
+        Detect emotions from faces in the image using HSEmotion
+        """
+        start_time = time.time()
+        
+        if not HSEMOTION_AVAILABLE or self.emotion_detector is None:
+            return {
+                'mode': 'emotion',
+                'error': 'Emotion detector not available. Install with: pip install hsemotion',
+                'processing_time': time.time() - start_time
+            }
+        
+        # Detect faces first
+        faces = self.detector.get(image)
+        
+        if len(faces) == 0:
+            return {
+                'mode': 'emotion',
+                'num_faces': 0,
+                'faces': [],
+                'processing_time': time.time() - start_time
+            }
+        
+        results = []
+        for face in faces:
+            bbox = face.bbox.astype(int)
+            x1, y1, x2, y2 = bbox
+            
+            # Ensure bbox is within image bounds
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(image.shape[1], x2)
+            y2 = min(image.shape[0], y2)
+            
+            # Crop face region
+            face_img = image[y1:y2, x1:x2]
+            
+            if face_img.size == 0 or face_img.shape[0] < 10 or face_img.shape[1] < 10:
+                continue
+            
+            # Detect emotion using HSEmotion
+            try:
+                # HSEmotion returns: emotion_name, confidence_scores
+                emotion, scores = self.emotion_detector.predict_emotions(face_img, logits=False)
+                
+                # HSEmotion emotions: Anger, Contempt, Disgust, Fear, Happiness, Neutral, Sadness, Surprise
+                emotion_map = {
+                    'Anger': 'angry',
+                    'Contempt': 'disgust',  # Map contempt to disgust
+                    'Disgust': 'disgust',
+                    'Fear': 'fear',
+                    'Happiness': 'happy',
+                    'Neutral': 'neutral',
+                    'Sadness': 'sad',
+                    'Surprise': 'surprise'
+                }
+                
+                # Get dominant emotion
+                dominant_emotion = emotion_map.get(emotion, emotion.lower())
+                
+                # Convert scores to dict
+                all_emotions = {}
+                emotion_labels = ['Anger', 'Contempt', 'Disgust', 'Fear', 'Happiness', 'Neutral', 'Sadness', 'Surprise']
+                for i, label in enumerate(emotion_labels):
+                    mapped_label = emotion_map.get(label, label.lower())
+                    if mapped_label in all_emotions:
+                        all_emotions[mapped_label] = max(all_emotions[mapped_label], float(scores[i]))
+                    else:
+                        all_emotions[mapped_label] = float(scores[i])
+                
+                confidence = all_emotions[dominant_emotion]
+                
+                results.append({
+                    'bbox': bbox.tolist(),
+                    'emotion': dominant_emotion,
+                    'confidence': float(confidence),
+                    'all_emotions': all_emotions
+                })
+                
+            except Exception as e:
+                print(f"Emotion detection error: {e}")
+                import traceback
+                traceback.print_exc()
+                results.append({
+                    'bbox': bbox.tolist(),
+                    'emotion': 'error',
+                    'confidence': 0.0,
+                    'error': str(e)
+                })
+        
+        processing_time = time.time() - start_time
+        
+        return {
+            'mode': 'emotion',
+            'num_faces': len(results),
+            'faces': results,
+            'processing_time': processing_time
+        }
+    
+    def check_liveness(self, image: np.ndarray, depth_image: Optional[np.ndarray], params: Dict) -> Dict:
+        """
+        Mode: liveness
+        Check if face is live using depth information
+        """
+        start_time = time.time()
+        
+        # Detect face first
+        faces = self.detector.get(image)
+        
+        if len(faces) == 0:
+            return {
+                'mode': 'liveness',
+                'is_live': False,
+                'reason': 'no_face_detected',
+                'processing_time': time.time() - start_time
+            }
+        
+        face = faces[0]
+        bbox = face.bbox.astype(int)
+        
+        # Check depth-based liveness
+        if depth_image is not None:
+            liveness_result = self._check_depth_liveness(depth_image, bbox)
+        else:
+            liveness_result = {
+                'is_live': None,
+                'reason': 'no_depth_data',
+                'method': 'none'
+            }
+        
+        processing_time = time.time() - start_time
+        
+        return {
+            'mode': 'liveness',
+            'bbox': bbox.tolist(),
+            **liveness_result,
+            'processing_time': processing_time
+        }
+    
+    def _check_depth_liveness(self, depth_image: np.ndarray, bbox: np.ndarray) -> Dict:
+        """Check liveness using depth variance"""
+        x1, y1, x2, y2 = bbox
+        
+        # Extract face depth region
+        face_depth = depth_image[y1:y2, x1:x2]
+        
+        # Filter out invalid depth values (0 or very far)
+        valid_depth = face_depth[(face_depth > 0) & (face_depth < 5000)]
+        
+        if len(valid_depth) < 100:
+            return {
+                'is_live': False,
+                'reason': 'insufficient_depth_data',
+                'method': 'depth_variance'
+            }
+        
+        # Calculate depth statistics
+        depth_variance = np.var(valid_depth)
+        depth_range = np.max(valid_depth) - np.min(valid_depth)
+        depth_mean = np.mean(valid_depth)
+        
+        # Thresholds (tunable)
+        min_variance = 100  # mm^2
+        min_range = 10  # mm
+        
+        is_live = (depth_variance > min_variance) and (depth_range > min_range)
+        
+        return {
+            'is_live': is_live,
+            'confidence': float(min(depth_variance / 1000, 1.0)),  # Normalize
+            'depth_variance': float(depth_variance),
+            'depth_range': float(depth_range),
+            'depth_mean': float(depth_mean),
+            'method': 'depth_variance'
+        }
+    
+    def match_face(self, embedding: np.ndarray, threshold: float) -> Optional[Dict]:
+        """Match face embedding against database"""
+        if not self.face_database:
+            print("[InsightFace] match_face: database is empty")
+            return None
+        
+        best_similarity = -1
+        best_match = None
+        
+        for person_id, data in self.face_database.items():
+            # Compare with all stored embeddings for this person
+            for stored_embedding in data['embeddings']:
+                similarity = np.dot(embedding, stored_embedding)
+                
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_match = {
+                        'person_id': person_id,
+                        'name': data['name'],
+                        'similarity': float(similarity)
+                    }
+        
+        print(f"[InsightFace] Best match: {best_match['name'] if best_match else 'none'} "
+              f"sim={best_similarity:.3f} threshold={threshold:.3f} "
+              f"{'✓ MATCH' if best_similarity >= threshold else '✗ NO MATCH'}")
+        
+        if best_similarity >= threshold:
+            # Update metadata
+            if best_match['person_id'] in self.metadata:
+                self.metadata[best_match['person_id']]['last_seen'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                self.metadata[best_match['person_id']]['encounter_count'] += 1
+                self.save_metadata()
+            
+            return best_match
+        
+        return None
+    
+    def process(self, image: np.ndarray, params: Dict, depth_image: Optional[np.ndarray] = None) -> Dict:
+        """Main processing function"""
+        mode = params.get('mode', 'detect_recognize')
+        
+        if mode == 'detect':
+            return self.detect_faces(image, params)
+        elif mode == 'recognize':
+            return self.recognize_face(image, params)
+        elif mode == 'detect_recognize':
+            return self.detect_and_recognize(image, params)
+        elif mode == 'register':
+            return self.register_face(image, params)
+        elif mode == 'liveness':
+            return self.check_liveness(image, depth_image, params)
+        elif mode == 'emotion':
+            return self.detect_emotion(image, params)
+        elif mode == 'analyze':
+            # Full analysis: detect + recognize + emotion merged per face
+            result = self.detect_and_recognize(image, params)
+            
+            # Merge emotion into each face result
+            if HSEMOTION_AVAILABLE and self.emotion_detector is not None and result['num_faces'] > 0:
+                try:
+                    emotion_result = self.detect_emotion(image, params)
+                    emo_faces = emotion_result.get('faces', [])
+                    # Match by bbox proximity and merge emotion into recognition result
+                    for face in result['faces']:
+                        fx1, fy1, fx2, fy2 = face['bbox']
+                        fc_x = (fx1 + fx2) / 2
+                        fc_y = (fy1 + fy2) / 2
+                        best_emo = None
+                        best_dist = float('inf')
+                        for ef in emo_faces:
+                            ex1, ey1, ex2, ey2 = ef['bbox']
+                            ec_x = (ex1 + ex2) / 2
+                            ec_y = (ey1 + ey2) / 2
+                            dist = ((fc_x - ec_x) ** 2 + (fc_y - ec_y) ** 2) ** 0.5
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_emo = ef
+                        if best_emo and best_dist < 100:
+                            face['emotion'] = best_emo.get('emotion')
+                            face['emotion_score'] = best_emo.get('confidence', 0.0)
+                except Exception as e:
+                    print(f"[InsightFace] Emotion merge failed: {e}")
+            
+            # Liveness check if depth available
+            if depth_image is not None and result['num_faces'] > 0:
+                liveness = self.check_liveness(image, depth_image, params)
+                result['liveness'] = liveness
+            
+            return result
+        else:
+            return {'error': f'Unknown mode: {mode}'}
+    
+    def visualize(self, image: np.ndarray, result: Dict, params: Dict) -> np.ndarray:
+        """Visualize results on image"""
+        vis_image = image.copy()
+        mode = result.get('mode', 'detect_recognize')
+        
+        if 'faces' in result:
+            for face in result['faces']:
+                bbox = face['bbox']
+                x1, y1, x2, y2 = map(int, bbox)
+                
+                # Determine color based on recognition
+                if face.get('recognized', False):
+                    color = (0, 255, 0)  # Green for recognized
+                    label = face.get('name', 'Unknown')
+                    if 'similarity' in face:
+                        label += f" ({face['similarity']:.2f})"
+                else:
+                    color = (0, 165, 255)  # Orange for unknown
+                    label = "Unknown"
+                
+                # Draw bbox
+                cv2.rectangle(vis_image, (x1, y1), (x2, y2), color, 2)
+                
+                # Draw label
+                cv2.putText(vis_image, label, (x1, y1 - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                
+                # Draw landmarks if available
+                if face.get('landmarks'):
+                    landmarks = np.array(face['landmarks'], dtype=np.int32)
+                    for point in landmarks:
+                        cv2.circle(vis_image, tuple(point), 2, (0, 255, 255), -1)
+                
+                # Draw attributes
+                y_offset = y2 + 20
+                if 'age' in face:
+                    cv2.putText(vis_image, f"Age: {face['age']}", (x1, y_offset),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    y_offset += 20
+                if 'gender' in face:
+                    cv2.putText(vis_image, f"Gender: {face['gender']}", (x1, y_offset),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    y_offset += 20
+                if 'emotion' in face:
+                    emotion_text = f"{face['emotion']}"
+                    if 'confidence' in face:
+                        emotion_text += f" ({face['confidence']:.2f})"
+                    # Color code emotions
+                    emotion_color = {
+                        'happy': (0, 255, 0),
+                        'sad': (255, 0, 0),
+                        'angry': (0, 0, 255),
+                        'surprise': (255, 255, 0),
+                        'fear': (128, 0, 128),
+                        'disgust': (0, 128, 128),
+                        'neutral': (128, 128, 128)
+                    }.get(face['emotion'], color)
+                    cv2.putText(vis_image, emotion_text, (x1, y_offset),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, emotion_color, 2)
+        
+        # Draw liveness result
+        if 'liveness' in result:
+            liveness = result['liveness']
+            if liveness.get('is_live') is not None:
+                status = "LIVE" if liveness['is_live'] else "SPOOF"
+                color = (0, 255, 0) if liveness['is_live'] else (0, 0, 255)
+                cv2.putText(vis_image, f"Liveness: {status}", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        
+        return vis_image
+    
+    def get_info(self) -> Dict:
+        """Get model information"""
+        return {
+            'model': 'InsightFace',
+            'modes': ['detect', 'recognize', 'detect_recognize', 'register', 'liveness', 'emotion', 'analyze'],
+            'database_size': len(self.face_database),
+            'total_samples': sum(len(data['embeddings']) for data in self.face_database.values()),
+            'registered_people': list(self.metadata.keys()),
+            'emotion_available': HSEMOTION_AVAILABLE and self.emotion_detector is not None
+        }
