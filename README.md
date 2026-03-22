@@ -1,18 +1,16 @@
 # HowYouSeeMe: World Perception System
 
-HowYouSeeMe is a unified perception system that integrates multiple computer vision models (YOLO, SLAM, Segmentation, VLMs) to build a comprehensive, real-time world state summarizer. It explores how AI systems can perceive and interpret complex environments, serving as a foundational interface for higher-level reasoning.
+HowYouSeeMe is a unified perception system that integrates multiple computer vision models (YOLO, SLAM, segmentation, VLMs) into a cohesive world state summarizer. It explores how AI systems can build and maintain a persistent, interpretable understanding of visual environments, acting as a foundational layer for more complex reasoning.
 
 ## Key Features
 - **Multi-Model Integration**: Combines object detection, spatial mapping, and semantic segmentation.
-- **Unified World State**: Fuses disparate vision outputs into a single, coherent representation.
-- **Real-Time Summarization**: Provides continuous, interpretable descriptions of the perceived environment.
+- **Unified World State**: Maintains a persistent and queryable representation of the visual environment.
+- **MCP Interface**: Provides a standardized Model Context Protocol server for easy interaction with other AI components.
 
 ## Tech Stack
-- Python
-- YOLO (Object Detection)
-- SLAM (Simultaneous Localization and Mapping)
-- Segment Anything Model (Segmentation)
-- Vision Language Models (VLMs)
+- Python, OpenCV, PyTorch
+- YOLO, Segment Anything Model (SAM), Visual Language Models (VLMs)
+- FastMCP, NumPy
 
 ## Getting Started
 ```bash
